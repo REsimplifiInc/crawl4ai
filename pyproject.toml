@@ -74,7 +74,7 @@ all = [
     "transformers",
     "tokenizers",
     "sentence-transformers",
-    "selenium"
+    "selenium",
 ]
 
 [project.scripts]
