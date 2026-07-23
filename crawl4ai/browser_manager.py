@@ -21,6 +21,8 @@ import warnings
 
 
 CAMOUFOX_CLEANUP_TIMEOUT_SECONDS = 15.0
+CAMOUFOX_PROCESS_TERMINATE_GRACE_SECONDS = 2.0
+CAMOUFOX_PROCESS_KILL_GRACE_SECONDS = 5.0
 
 
 BROWSER_DISABLE_OPTIONS = [
@@ -919,6 +921,118 @@ class _CamoufoxRuntimeBackend:
             await self._context_manager.__aexit__(None, None, None)
         finally:
             self._context_manager = None
+
+    def capture_owned_resources(self):
+        context_manager = self._context_manager
+        if context_manager is None:
+            return None, None, None
+        connection = getattr(context_manager, "_connection", None)
+        transport = getattr(connection, "_transport", None)
+        driver_process = getattr(transport, "_proc", None)
+        transport_error = getattr(transport, "on_error_future", None)
+        browser = getattr(context_manager, "browser", None)
+        virtual_display = getattr(browser, "_virtual_display", None)
+        return driver_process, virtual_display, transport_error
+
+    async def force_terminate(
+        self,
+        driver_process,
+        virtual_display,
+        transport_error,
+    ):
+        try:
+            if driver_process is None:
+                raise RuntimeError(
+                    "Camoufox driver process handle is unavailable after cleanup timeout"
+                )
+            await self._terminate_process_tree(driver_process)
+        finally:
+            try:
+                if virtual_display is not None:
+                    await asyncio.to_thread(virtual_display.kill)
+            finally:
+                self._consume_future_result(transport_error)
+                self._context_manager = None
+
+    @classmethod
+    def _consume_future_result(cls, future):
+        if future is None:
+            return
+        if future.done():
+            if not future.cancelled():
+                future.exception()
+            return
+        future.add_done_callback(cls._consume_future_result)
+
+    async def _terminate_process_tree(self, driver_process):
+        pid = getattr(driver_process, "pid", None)
+        descendants = []
+        if pid is not None:
+            try:
+                descendants = await asyncio.to_thread(
+                    psutil.Process(pid).children,
+                    True,
+                )
+            except psutil.Error:
+                pass
+
+        alive, driver_exited = await self._signal_and_wait(
+            driver_process,
+            descendants,
+            action="terminate",
+            timeout=CAMOUFOX_PROCESS_TERMINATE_GRACE_SECONDS,
+        )
+        if alive or not driver_exited:
+            alive, driver_exited = await self._signal_and_wait(
+                driver_process,
+                alive,
+                action="kill",
+                timeout=CAMOUFOX_PROCESS_KILL_GRACE_SECONDS,
+            )
+        if alive or not driver_exited:
+            survivor_pids = [process.pid for process in alive]
+            if not driver_exited and pid is not None:
+                survivor_pids.append(pid)
+            raise RuntimeError(
+                "Camoufox process cleanup could not reap owned processes: "
+                f"{sorted(set(survivor_pids))}"
+            )
+
+    async def _signal_and_wait(
+        self,
+        driver_process,
+        descendants,
+        *,
+        action: str,
+        timeout: float,
+    ):
+        for process in reversed(descendants):
+            try:
+                getattr(process, action)()
+            except psutil.Error:
+                pass
+
+        if getattr(driver_process, "returncode", None) is None:
+            try:
+                getattr(driver_process, action)()
+            except ProcessLookupError:
+                pass
+
+        (_, alive), driver_exited = await asyncio.gather(
+            asyncio.to_thread(psutil.wait_procs, descendants, timeout),
+            self._wait_for_driver_exit(driver_process, timeout),
+        )
+        return alive, driver_exited
+
+    @staticmethod
+    async def _wait_for_driver_exit(driver_process, timeout: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while getattr(driver_process, "returncode", None) is None:
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(min(0.05, timeout))
+        await driver_process.wait()
+        return True
 
 
 class BrowserManager:
@@ -2157,24 +2271,43 @@ class BrowserManager:
             asyncio.create_task(self.kill_session(sid))
 
     async def _await_camoufox_cleanup(self, cleanup, resource: str):
+        cleanup_task = asyncio.ensure_future(cleanup)
         try:
-            await asyncio.wait_for(
-                cleanup,
+            done, _ = await asyncio.wait(
+                {cleanup_task},
                 timeout=CAMOUFOX_CLEANUP_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
-            if self.logger:
-                self.logger.warning(
-                    message=(
-                        "Timed out after {timeout}s closing Camoufox {resource}; "
-                        "continuing remaining cleanup"
-                    ),
-                    tag="BROWSER",
-                    params={
-                        "timeout": CAMOUFOX_CLEANUP_TIMEOUT_SECONDS,
-                        "resource": resource,
-                    },
-                )
+        except BaseException:
+            cleanup_task.cancel()
+            raise
+        if cleanup_task in done:
+            await cleanup_task
+            return True
+
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        if cleanup_task.done():
+            self._consume_cleanup_task_result(cleanup_task)
+        else:
+            cleanup_task.add_done_callback(self._consume_cleanup_task_result)
+        if self.logger:
+            self.logger.warning(
+                message=(
+                    "Timed out after {timeout}s closing Camoufox {resource}; "
+                    "continuing remaining cleanup"
+                ),
+                tag="BROWSER",
+                params={
+                    "timeout": CAMOUFOX_CLEANUP_TIMEOUT_SECONDS,
+                    "resource": resource,
+                },
+            )
+        return False
+
+    @staticmethod
+    def _consume_cleanup_task_result(task):
+        if not task.cancelled():
+            task.exception()
 
     async def close(self):
         """Close all browser resources and clean up."""
@@ -2260,11 +2393,22 @@ class BrowserManager:
             self._context_last_used.clear()
             self._page_to_sig.clear()
 
+            owned_resources = self.runtime_backend.capture_owned_resources()
             try:
-                await self._await_camoufox_cleanup(
+                backend_closed = await self._await_camoufox_cleanup(
                     self.runtime_backend.close(),
                     "runtime backend",
                 )
+                if not backend_closed:
+                    if self.logger:
+                        self.logger.warning(
+                            message=(
+                                "Camoufox runtime backend did not close in time; "
+                                "force terminating its owned process tree"
+                            ),
+                            tag="BROWSER",
+                        )
+                    await self.runtime_backend.force_terminate(*owned_resources)
             finally:
                 self.browser = None
                 self.default_context = None

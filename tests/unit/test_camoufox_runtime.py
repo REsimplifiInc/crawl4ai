@@ -1,7 +1,9 @@
 import asyncio
+import sys
 import time
 import types
 
+import psutil
 import pytest
 
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
@@ -58,6 +60,14 @@ class FakeBrowser:
         self.closed = True
 
 
+class FakeDriverProcess:
+    pid = None
+    returncode = 0
+
+    async def wait(self):
+        return self.returncode
+
+
 class FakeAsyncCamoufox:
     instances = []
 
@@ -66,6 +76,10 @@ class FakeAsyncCamoufox:
         self.entered = False
         self.exited = False
         self.result = None
+        self.browser = None
+        self._connection = types.SimpleNamespace(
+            _transport=types.SimpleNamespace(_proc=FakeDriverProcess())
+        )
         type(self).instances.append(self)
 
     async def __aenter__(self):
@@ -74,6 +88,7 @@ class FakeAsyncCamoufox:
             self.result = FakeContext()
         else:
             self.result = FakeBrowser()
+        self.browser = self.result
         return self.result
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -108,6 +123,70 @@ class HangingExitCamoufox(FakeAsyncCamoufox):
         except asyncio.CancelledError:
             self.exit_cancelled = True
             raise
+
+
+class CancellationResistantExitCamoufox(HangingExitCamoufox):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.release_exit = asyncio.Event()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exit_started = True
+        while not self.release_exit.is_set():
+            try:
+                await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                self.exit_cancelled = True
+        self.exited = True
+
+
+class FakeVirtualDisplay:
+    def __init__(self):
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+
+async def spawn_ignoring_process_tree():
+    child_code = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(60)"
+    )
+    parent_code = (
+        "import signal,subprocess,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        "print(child.pid,flush=True);"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(60)"
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        parent_code,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    child_pid = int((await process.stdout.readline()).decode().strip())
+    return process, child_pid
+
+
+async def stop_process_tree(process, child_pid):
+    for pid in (child_pid, process.pid):
+        try:
+            psutil.Process(pid).kill()
+        except psutil.Error:
+            pass
+    if process.returncode is None:
+        await process.wait()
+
+
+async def wait_for_pid_exit(pid, timeout=1.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while psutil.pid_exists(pid) and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    return not psutil.pid_exists(pid)
 
 
 @pytest.fixture(autouse=True)
@@ -410,6 +489,177 @@ async def test_camoufox_backend_close_timeout_clears_runtime_state(monkeypatch):
     assert manager.runtime_backend._context_manager is None
     assert manager.browser is None
     assert manager.default_context is None
+
+
+@pytest.mark.asyncio
+async def test_camoufox_backend_timeout_without_driver_handle_fails_cleanup(
+    monkeypatch,
+):
+    install_fake_camoufox(monkeypatch, HangingExitCamoufox)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = HangingExitCamoufox.instances[-1]
+    instance._connection = None
+
+    with pytest.raises(RuntimeError, match="driver process handle is unavailable"):
+        await manager.close()
+
+    assert manager.runtime_backend._context_manager is None
+    assert manager.browser is None
+    assert manager.default_context is None
+
+
+@pytest.mark.asyncio
+async def test_camoufox_backend_timeout_force_kills_and_reaps_owned_processes(
+    monkeypatch,
+):
+    install_fake_camoufox(monkeypatch, HangingExitCamoufox)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_TERMINATE_GRACE_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_KILL_GRACE_SECONDS",
+        0.2,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = HangingExitCamoufox.instances[-1]
+    process, child_pid = await spawn_ignoring_process_tree()
+    virtual_display = FakeVirtualDisplay()
+    transport_error = asyncio.get_running_loop().create_future()
+    transport_error.set_exception(
+        RuntimeError("Connection closed while reading from the driver")
+    )
+    instance._connection = types.SimpleNamespace(
+        _transport=types.SimpleNamespace(
+            _proc=process,
+            on_error_future=transport_error,
+        )
+    )
+    instance.result._virtual_display = virtual_display
+
+    try:
+        await asyncio.wait_for(manager.close(), timeout=1.0)
+
+        assert process.returncode is not None
+        assert await wait_for_pid_exit(child_pid)
+        assert virtual_display.killed is True
+        assert transport_error._log_traceback is False
+        assert manager.runtime_backend._context_manager is None
+    finally:
+        await stop_process_tree(process, child_pid)
+
+
+@pytest.mark.asyncio
+async def test_camoufox_backend_timeout_escalates_when_close_ignores_cancellation(
+    monkeypatch,
+):
+    install_fake_camoufox(monkeypatch, CancellationResistantExitCamoufox)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_TERMINATE_GRACE_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_KILL_GRACE_SECONDS",
+        0.2,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = CancellationResistantExitCamoufox.instances[-1]
+    process, child_pid = await spawn_ignoring_process_tree()
+    instance._connection = types.SimpleNamespace(
+        _transport=types.SimpleNamespace(_proc=process)
+    )
+    close_task = asyncio.create_task(manager.close())
+
+    try:
+        await asyncio.sleep(0.15)
+
+        assert close_task.done()
+        await close_task
+        assert instance.exit_cancelled is True
+        assert process.returncode is not None
+        assert await wait_for_pid_exit(child_pid)
+        assert manager.runtime_backend._context_manager is None
+    finally:
+        instance.release_exit.set()
+        if not close_task.done():
+            await close_task
+        await asyncio.sleep(0)
+        await stop_process_tree(process, child_pid)
+
+
+@pytest.mark.asyncio
+async def test_camoufox_normal_backend_close_does_not_force_kill_process_tree(
+    monkeypatch,
+):
+    install_fake_camoufox(monkeypatch)
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = FakeAsyncCamoufox.instances[-1]
+    process, child_pid = await spawn_ignoring_process_tree()
+    instance._connection = types.SimpleNamespace(
+        _transport=types.SimpleNamespace(_proc=process)
+    )
+
+    try:
+        await manager.close()
+
+        assert process.returncode is None
+        assert psutil.pid_exists(child_pid)
+    finally:
+        await stop_process_tree(process, child_pid)
 
 
 @pytest.mark.asyncio
