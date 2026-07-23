@@ -20,6 +20,9 @@ from .utils import get_chromium_path
 import warnings
 
 
+CAMOUFOX_CLEANUP_TIMEOUT_SECONDS = 15.0
+
+
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -912,8 +915,10 @@ class _CamoufoxRuntimeBackend:
     async def close(self):
         if self._context_manager is None:
             return
-        await self._context_manager.__aexit__(None, None, None)
-        self._context_manager = None
+        try:
+            await self._context_manager.__aexit__(None, None, None)
+        finally:
+            self._context_manager = None
 
 
 class BrowserManager:
@@ -1916,9 +1921,21 @@ class BrowserManager:
                             self._context_refcounts.pop(sig, None)
                             self._context_last_used.pop(sig, None)
                             should_close_context = True
-            await page.close()
+            if self.config.is_camoufox:
+                await self._await_camoufox_cleanup(
+                    page.close(),
+                    f"session page {session_id}",
+                )
+            else:
+                await page.close()
             if should_close_context:
-                await context.close()
+                if self.config.is_camoufox:
+                    await self._await_camoufox_cleanup(
+                        context.close(),
+                        f"session context {session_id}",
+                    )
+                else:
+                    await context.close()
             del self.sessions[session_id]
 
     def release_page(self, page):
@@ -2139,6 +2156,26 @@ class BrowserManager:
         for sid in expired_sessions:
             asyncio.create_task(self.kill_session(sid))
 
+    async def _await_camoufox_cleanup(self, cleanup, resource: str):
+        try:
+            await asyncio.wait_for(
+                cleanup,
+                timeout=CAMOUFOX_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            if self.logger:
+                self.logger.warning(
+                    message=(
+                        "Timed out after {timeout}s closing Camoufox {resource}; "
+                        "continuing remaining cleanup"
+                    ),
+                    tag="BROWSER",
+                    params={
+                        "timeout": CAMOUFOX_CLEANUP_TIMEOUT_SECONDS,
+                        "resource": resource,
+                    },
+                )
+
     async def close(self):
         """Close all browser resources and clean up."""
         # Cached CDP path: only clean up this instance's sessions/contexts,
@@ -2210,9 +2247,12 @@ class BrowserManager:
             for session_id in session_ids:
                 await self.kill_session(session_id)
 
-            for ctx in self.contexts_by_config.values():
+            for context_name, ctx in self.contexts_by_config.items():
                 try:
-                    await ctx.close()
+                    await self._await_camoufox_cleanup(
+                        ctx.close(),
+                        f"context {context_name}",
+                    )
                 except Exception:
                     pass
             self.contexts_by_config.clear()
@@ -2220,10 +2260,15 @@ class BrowserManager:
             self._context_last_used.clear()
             self._page_to_sig.clear()
 
-            await self.runtime_backend.close()
-            self.browser = None
-            self.default_context = None
-            self._launched_persistent = False
+            try:
+                await self._await_camoufox_cleanup(
+                    self.runtime_backend.close(),
+                    "runtime backend",
+                )
+            finally:
+                self.browser = None
+                self.default_context = None
+                self._launched_persistent = False
             return
 
         # ── Persistent context launched via launch_persistent_context ──

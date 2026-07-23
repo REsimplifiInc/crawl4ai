@@ -1,3 +1,5 @@
+import asyncio
+import time
 import types
 
 import pytest
@@ -78,6 +80,36 @@ class FakeAsyncCamoufox:
         self.exited = True
 
 
+class HangingCloseContext(FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.close_started = False
+        self.close_cancelled = False
+
+    async def close(self):
+        self.close_started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.close_cancelled = True
+            raise
+
+
+class HangingExitCamoufox(FakeAsyncCamoufox):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.exit_started = False
+        self.exit_cancelled = False
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exit_started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.exit_cancelled = True
+            raise
+
+
 @pytest.fixture(autouse=True)
 def reset_fake_instances():
     FakeAsyncCamoufox.instances.clear()
@@ -85,12 +117,12 @@ def reset_fake_instances():
     FakeAsyncCamoufox.instances.clear()
 
 
-def install_fake_camoufox(monkeypatch):
+def install_fake_camoufox(monkeypatch, camoufox_cls=FakeAsyncCamoufox):
     real_import_module = browser_manager_module.importlib.import_module
 
     def fake_import_module(name, *args, **kwargs):
         if name == "camoufox.async_api":
-            return types.SimpleNamespace(AsyncCamoufox=FakeAsyncCamoufox)
+            return types.SimpleNamespace(AsyncCamoufox=camoufox_cls)
         return real_import_module(name, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -318,4 +350,92 @@ async def test_camoufox_browser_manager_persistent_launch_and_cleanup(
 
     await manager.close()
 
+    assert instance.exited is True
+
+
+@pytest.mark.asyncio
+async def test_camoufox_context_close_timeout_continues_backend_cleanup(monkeypatch):
+    install_fake_camoufox(monkeypatch)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = FakeAsyncCamoufox.instances[-1]
+    context = HangingCloseContext()
+    manager.contexts_by_config["hung-context"] = context
+
+    await asyncio.wait_for(manager.close(), timeout=0.2)
+
+    assert context.close_started is True
+    assert context.close_cancelled is True
+    assert instance.exited is True
+    assert manager.contexts_by_config == {}
+    assert manager.browser is None
+    assert manager.default_context is None
+
+
+@pytest.mark.asyncio
+async def test_camoufox_backend_close_timeout_clears_runtime_state(monkeypatch):
+    install_fake_camoufox(monkeypatch, HangingExitCamoufox)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = HangingExitCamoufox.instances[-1]
+
+    await asyncio.wait_for(manager.close(), timeout=0.2)
+
+    assert instance.exit_started is True
+    assert instance.exit_cancelled is True
+    assert manager.runtime_backend._context_manager is None
+    assert manager.browser is None
+    assert manager.default_context is None
+
+
+@pytest.mark.asyncio
+async def test_camoufox_session_close_timeout_continues_manager_cleanup(monkeypatch):
+    install_fake_camoufox(monkeypatch)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    instance = FakeAsyncCamoufox.instances[-1]
+    page = HangingCloseContext()
+    manager.sessions["hung-session"] = (FakeContext(), page, time.time())
+
+    await asyncio.wait_for(manager.close(), timeout=0.2)
+
+    assert page.close_started is True
+    assert page.close_cancelled is True
+    assert manager.sessions == {}
     assert instance.exited is True
