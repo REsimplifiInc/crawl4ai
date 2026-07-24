@@ -663,6 +663,72 @@ async def test_camoufox_normal_backend_close_does_not_force_kill_process_tree(
 
 
 @pytest.mark.asyncio
+async def test_stale_cancelled_close_does_not_clobber_next_generation_context(
+    monkeypatch,
+):
+    install_fake_camoufox(monkeypatch, CancellationResistantExitCamoufox)
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_TERMINATE_GRACE_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser_manager_module,
+        "CAMOUFOX_PROCESS_KILL_GRACE_SECONDS",
+        0.2,
+        raising=False,
+    )
+    manager = BrowserManager(
+        browser_config=BrowserConfig(
+            browser_runtime="camoufox",
+            browser_type="firefox",
+        ),
+        logger=AsyncLogger(verbose=False),
+    )
+    await manager.start()
+    stale_instance = CancellationResistantExitCamoufox.instances[-1]
+    process, child_pid = await spawn_ignoring_process_tree()
+    stale_instance._connection = types.SimpleNamespace(
+        _transport=types.SimpleNamespace(_proc=process)
+    )
+    new_instance = None
+
+    try:
+        # First close times out, escalates, force-kills the owned tree, but
+        # the fake __aexit__ keeps running because it ignores cancellation.
+        await manager.close()
+        assert manager.runtime_backend._context_manager is None
+
+        # A new session starts on the same reused manager/runtime_backend
+        # before the stale close() task from the first generation unwinds.
+        await manager.start()
+        new_instance = CancellationResistantExitCamoufox.instances[-1]
+        assert new_instance is not stale_instance
+        current_context_manager = manager.runtime_backend._context_manager
+        assert current_context_manager is new_instance
+
+        # Now let the stale first-generation __aexit__ finish. Its `finally`
+        # must not clear the second generation's _context_manager.
+        stale_instance.release_exit.set()
+        await asyncio.sleep(0.05)
+
+        assert manager.runtime_backend._context_manager is current_context_manager
+    finally:
+        stale_instance.release_exit.set()
+        if new_instance is not None:
+            new_instance.release_exit.set()
+        await stop_process_tree(process, child_pid)
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_camoufox_session_close_timeout_continues_manager_cleanup(monkeypatch):
     install_fake_camoufox(monkeypatch)
     monkeypatch.setattr(

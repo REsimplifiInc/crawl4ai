@@ -915,27 +915,34 @@ class _CamoufoxRuntimeBackend:
         )
 
     async def close(self):
-        if self._context_manager is None:
+        context_manager = self._context_manager
+        if context_manager is None:
             return
         try:
-            await self._context_manager.__aexit__(None, None, None)
+            await context_manager.__aexit__(None, None, None)
         finally:
-            self._context_manager = None
+            # A cancelled __aexit__ that ignores cancellation can still be
+            # running when this finally fires later (after force_terminate
+            # already cleared this generation) or after a subsequent start()
+            # has assigned a new _context_manager. Only clear our own slot.
+            if self._context_manager is context_manager:
+                self._context_manager = None
 
     def capture_owned_resources(self):
         context_manager = self._context_manager
         if context_manager is None:
-            return None, None, None
+            return None, None, None, None
         connection = getattr(context_manager, "_connection", None)
         transport = getattr(connection, "_transport", None)
         driver_process = getattr(transport, "_proc", None)
         transport_error = getattr(transport, "on_error_future", None)
         browser = getattr(context_manager, "browser", None)
         virtual_display = getattr(browser, "_virtual_display", None)
-        return driver_process, virtual_display, transport_error
+        return context_manager, driver_process, virtual_display, transport_error
 
     async def force_terminate(
         self,
+        context_manager,
         driver_process,
         virtual_display,
         transport_error,
@@ -952,7 +959,8 @@ class _CamoufoxRuntimeBackend:
                     await asyncio.to_thread(virtual_display.kill)
             finally:
                 self._consume_future_result(transport_error)
-                self._context_manager = None
+                if self._context_manager is context_manager:
+                    self._context_manager = None
 
     @classmethod
     def _consume_future_result(cls, future):
