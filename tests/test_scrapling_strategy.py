@@ -50,6 +50,40 @@ class FakeSession:
         return FakeScraplingResponse()
 
 
+class RecordingPage:
+    def __init__(self):
+        self.events: list[str] = []
+
+    async def wait_for_function(self, _condition, timeout):
+        self.events.append(f"wait_function:{timeout}")
+
+    def locator(self, selector):
+        page = self
+
+        class Locator:
+            def __init__(self):
+                self.first = self
+
+            async def wait_for(self, *, state, timeout):
+                page.events.append(f"wait_selector:{selector}:{state}:{timeout}")
+
+        return Locator()
+
+    async def evaluate(self, script, *_args):
+        self.events.append("evaluate")
+        if "document.title" in script:
+            return "Stealth listing"
+        return None
+
+    async def screenshot(self):
+        self.events.append("screenshot")
+        return b"screenshot"
+
+    async def pdf(self):
+        self.events.append("pdf")
+        return b"pdf"
+
+
 @pytest.fixture(autouse=True)
 def reset_fake_sessions():
     FakeSession.instances.clear()
@@ -112,6 +146,83 @@ async def test_scrapling_strategy_maps_browser_and_fetch_config_and_response():
     assert response.status_code == 200
     assert response.response_headers == FakeScraplingResponse.headers
     assert response.redirected_url == "https://example.test/final"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_uses_run_identity_and_default_scrapling_user_agent():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    await strategy.crawl(
+        "https://example.test/listing",
+        CrawlerRunConfig(locale="fr-FR", timezone_id="Europe/Paris"),
+    )
+
+    session = FakeSession.instances[0]
+    assert session.kwargs["locale"] == "fr-FR"
+    assert session.kwargs["timezone_id"] == "Europe/Paris"
+    assert "useragent" not in session.kwargs
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_runs_wait_before_actions_and_returns_js_result():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+    captures = {}
+    page = RecordingPage()
+    action = strategy._build_page_action(
+        CrawlerRunConfig(
+            wait_for="css:.listing",
+            js_code="return document.title;",
+            screenshot=True,
+        ),
+        captures,
+    )
+
+    await action(page)
+
+    assert page.events == [
+        "wait_selector:.listing:attached:60000",
+        "evaluate",
+        "screenshot",
+    ]
+    assert captures["js_execution_result"] == {
+        "success": True,
+        "results": [{"success": True, "result": "Stealth listing"}],
+    }
+    assert captures["screenshot"] == b"screenshot"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_browser_processes_raw_content():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    response = await strategy.crawl(
+        "raw:<html><body>dynamic</body></html>",
+        CrawlerRunConfig(process_in_browser=True, base_url="https://example.test/"),
+    )
+
+    session = FakeSession.instances[0]
+    assert session.fetch_calls[0][0].startswith("file://")
+    assert response.redirected_url == "https://example.test/"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_retries_failed_session_start():
+    class RetryableSession(FakeSession):
+        starts = 0
+
+        async def start(self):
+            type(self).starts += 1
+            if type(self).starts == 1:
+                raise RuntimeError("startup failed")
+            await super().start()
+
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=RetryableSession)
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await strategy.start()
+    await strategy.start()
+
+    assert RetryableSession.starts == 2
 
 
 @pytest.mark.asyncio
