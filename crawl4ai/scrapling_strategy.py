@@ -405,9 +405,14 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             result: dict[str, Any] = {}
             try:
                 if config.js_code_before_wait:
-                    result["before_wait"] = await self._evaluate_scripts(
-                        page, config.js_code_before_wait
-                    )
+                    try:
+                        result["before_wait"] = await self._evaluate_scripts(
+                            page, config.js_code_before_wait
+                        )
+                    except Exception as exc:
+                        if not self._is_navigation_context_error(exc):
+                            raise
+                        return result
                 if config.wait_for:
                     await self._wait_for_condition(
                         page,
@@ -420,7 +425,12 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
                         self._virtual_scroll_config_data(config.virtual_scroll_config),
                     )
                 if config.js_code:
-                    js_values = await self._evaluate_scripts(page, config.js_code)
+                    try:
+                        js_values = await self._evaluate_scripts(page, config.js_code)
+                    except Exception as exc:
+                        if not self._is_navigation_context_error(exc):
+                            raise
+                        return result
                     result["js"] = js_values
                     scripts = (
                         config.js_code
@@ -533,6 +543,11 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         for script in scripts if isinstance(scripts, list) else [scripts]:
             values.append(await page.evaluate(f"(async () => {{ {script} }})()"))
         return values[-1] if len(values) == 1 else values
+
+    @staticmethod
+    def _is_navigation_context_error(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return "execution context was destroyed" in message and "navigation" in message
 
     async def _ensure_session(self, config: CrawlerRunConfig) -> None:
         identity = self._resolve_session_identity(

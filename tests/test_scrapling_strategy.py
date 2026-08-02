@@ -87,6 +87,15 @@ class RecordingPage:
         return b"pdf"
 
 
+class NavigationDuringEvaluatePage(RecordingPage):
+    async def evaluate(self, script, *_args):
+        if "#human" in script:
+            raise RuntimeError(
+                "Page.evaluate: Execution context was destroyed, most likely because of a navigation."
+            )
+        return await super().evaluate(script, *_args)
+
+
 @pytest.fixture(autouse=True)
 def reset_fake_sessions():
     FakeSession.instances.clear()
@@ -280,6 +289,21 @@ async def test_scrapling_strategy_runs_wait_before_actions_and_returns_js_result
         "results": [{"success": True, "result": "Stealth listing"}],
     }
     assert captures["screenshot"] == b"screenshot"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_allows_js_actions_that_navigate_the_page():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+    captures = {}
+    action = strategy._build_page_action(
+        CrawlerRunConfig(js_code="document.querySelector('#human')?.click();"),
+        captures,
+    )
+
+    result = await action(NavigationDuringEvaluatePage())
+
+    assert result == {}
+    assert "page_action_error" not in captures
 
 
 @pytest.mark.asyncio
