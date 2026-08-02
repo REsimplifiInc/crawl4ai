@@ -12,6 +12,7 @@ from crawl4ai import (
     BrowserConfig,
     CacheMode,
     CrawlerRunConfig,
+    GeolocationConfig,
 )
 
 
@@ -53,6 +54,7 @@ class FakeSession:
 class RecordingPage:
     def __init__(self):
         self.events: list[str] = []
+        self.evaluate_calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def wait_for_function(self, _condition, timeout):
         self.events.append(f"wait_function:{timeout}")
@@ -71,6 +73,7 @@ class RecordingPage:
 
     async def evaluate(self, script, *_args):
         self.events.append("evaluate")
+        self.evaluate_calls.append((script, _args))
         if "document.title" in script:
             return "Stealth listing"
         return None
@@ -165,6 +168,31 @@ async def test_scrapling_strategy_uses_run_identity_and_default_scrapling_user_a
 
 
 @pytest.mark.asyncio
+async def test_scrapling_strategy_applies_run_geolocation_to_browser_context():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    await strategy.crawl(
+        "https://example.test/listing",
+        CrawlerRunConfig(
+            geolocation=GeolocationConfig(
+                latitude=51.5074,
+                longitude=-0.1278,
+                accuracy=25,
+            )
+        ),
+    )
+
+    assert FakeSession.instances[0].kwargs["additional_args"] == {
+        "geolocation": {
+            "latitude": 51.5074,
+            "longitude": -0.1278,
+            "accuracy": 25,
+        },
+        "permissions": ["geolocation"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_scrapling_strategy_restarts_preflight_session_for_run_identity():
     strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
 
@@ -252,6 +280,35 @@ async def test_scrapling_strategy_runs_wait_before_actions_and_returns_js_result
         "results": [{"success": True, "result": "Stealth listing"}],
     }
     assert captures["screenshot"] == b"screenshot"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_executes_crawl4ai_virtual_scroll_capture():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+    page = RecordingPage()
+    action = strategy._build_page_action(
+        CrawlerRunConfig(
+            virtual_scroll_config={
+                "container_selector": "#feed",
+                "scroll_count": 3,
+                "scroll_by": "page_height",
+                "wait_after_scroll": 0.1,
+            }
+        ),
+        {},
+    )
+
+    await action(page)
+
+    assert len(page.evaluate_calls) == 1
+    script, args = page.evaluate_calls[0]
+    assert "htmlChunks" in script
+    assert args[0] == {
+        "container_selector": "#feed",
+        "scroll_count": 3,
+        "scroll_by": "page_height",
+        "wait_after_scroll": 0.1,
+    }
 
 
 @pytest.mark.asyncio

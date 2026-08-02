@@ -46,6 +46,72 @@ async ({max_scroll_steps, scroll_delay}) => {
     }
 }
 """
+_VIRTUAL_SCROLL_JS = r"""
+async (config) => {
+    const container = document.querySelector(config.container_selector);
+    if (!container) {
+        throw new Error(`Container not found: ${config.container_selector}`);
+    }
+
+    const htmlChunks = [];
+    let previousHTML = container.innerHTML;
+    let scrollCount = 0;
+    let scrollAmount;
+    if (typeof config.scroll_by === "number") {
+        scrollAmount = config.scroll_by;
+    } else if (config.scroll_by === "page_height") {
+        scrollAmount = window.innerHeight;
+    } else {
+        scrollAmount = container.offsetHeight;
+    }
+
+    while (scrollCount < config.scroll_count) {
+        container.scrollTop += scrollAmount;
+        await new Promise((resolve) => setTimeout(resolve, config.wait_after_scroll * 1000));
+        const currentHTML = container.innerHTML;
+
+        if (currentHTML !== previousHTML && !currentHTML.startsWith(previousHTML)) {
+            htmlChunks.push(previousHTML);
+        }
+        previousHTML = currentHTML;
+        scrollCount += 1;
+
+        if (container.scrollTop + container.clientHeight >= container.scrollHeight - 10) {
+            if (htmlChunks.length > 0) {
+                htmlChunks.push(currentHTML);
+            }
+            break;
+        }
+    }
+
+    if (htmlChunks.length === 0) {
+        return {success: true, chunksCount: 0, uniqueCount: 0, replaced: false};
+    }
+
+    const tempDiv = document.createElement("div");
+    const seenTexts = new Set();
+    const uniqueElements = [];
+    for (const chunk of htmlChunks) {
+        tempDiv.innerHTML = chunk;
+        for (const element of tempDiv.children) {
+            const normalizedText = element.innerText
+                .toLowerCase()
+                .replace(/[\s\W]/g, "");
+            if (!seenTexts.has(normalizedText)) {
+                seenTexts.add(normalizedText);
+                uniqueElements.push(element.outerHTML);
+            }
+        }
+    }
+    container.innerHTML = uniqueElements.join("\n");
+    return {
+        success: true,
+        chunksCount: htmlChunks.length,
+        uniqueCount: uniqueElements.length,
+        replaced: true,
+    };
+}
+"""
 _LEGACY_DEFAULT_CHROMIUM_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36"
 )
@@ -75,6 +141,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         self.scrapling_options = dict(scrapling_options or {})
         self._session: Any | None = None
         self._session_identity: tuple[str | None, str | None] | None = None
+        self._session_geolocation: tuple[float, float, float] | None = None
         self._session_user_agent: str | None = None
         self._session_has_fetched = False
 
@@ -95,6 +162,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         *,
         locale: str | None = None,
         timezone_id: str | None = None,
+        geolocation: Any | None = None,
     ) -> None:
         """Start one reusable Scrapling browser session."""
         if self._session is not None:
@@ -102,8 +170,11 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
 
         factory = self.session_factory or self._load_session_factory()
         identity = self._resolve_session_identity(locale, timezone_id)
+        resolved_geolocation = self._resolve_session_geolocation(geolocation)
         session_kwargs = self._build_session_kwargs(
-            locale=identity[0], timezone_id=identity[1]
+            locale=identity[0],
+            timezone_id=identity[1],
+            geolocation=resolved_geolocation,
         )
         session = factory(**session_kwargs)
         try:
@@ -121,6 +192,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             raise
         self._session = session
         self._session_identity = identity
+        self._session_geolocation = resolved_geolocation
         self._session_user_agent = self._resolve_session_user_agent()
         self._session_has_fetched = False
 
@@ -128,6 +200,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         """Close the Scrapling browser session and release its resources."""
         session, self._session = self._session, None
         self._session_identity = None
+        self._session_geolocation = None
         self._session_user_agent = None
         self._session_has_fetched = False
         if session is None:
@@ -244,6 +317,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         *,
         locale: str | None = None,
         timezone_id: str | None = None,
+        geolocation: tuple[float, float, float] | None = None,
     ) -> dict[str, Any]:
         config = self.browser_config
         kwargs: dict[str, Any] = {
@@ -254,6 +328,19 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             "locale": locale,
             "timezone_id": timezone_id,
         }
+        additional_args = dict(self.scrapling_options.get("additional_args") or {})
+        if geolocation is not None:
+            additional_args["geolocation"] = {
+                "latitude": geolocation[0],
+                "longitude": geolocation[1],
+                "accuracy": geolocation[2],
+            }
+            permissions = list(additional_args.get("permissions") or [])
+            if "geolocation" not in permissions:
+                permissions.append("geolocation")
+            additional_args["permissions"] = permissions
+        if additional_args:
+            kwargs["additional_args"] = additional_args
         if (
             config.user_agent
             and config.user_agent != _LEGACY_DEFAULT_CHROMIUM_USER_AGENT
@@ -267,7 +354,13 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         proxy = self._proxy_value(config.proxy_config)
         if proxy is not None:
             kwargs["proxy"] = proxy
-        kwargs.update(self.scrapling_options)
+        kwargs.update(
+            {
+                key: value
+                for key, value in self.scrapling_options.items()
+                if key != "additional_args"
+            }
+        )
         return {key: value for key, value in kwargs.items() if value is not None}
 
     @staticmethod
@@ -320,6 +413,11 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
                         page,
                         config.wait_for,
                         config.wait_for_timeout or config.page_timeout,
+                    )
+                if config.virtual_scroll_config:
+                    await page.evaluate(
+                        _VIRTUAL_SCROLL_JS,
+                        self._virtual_scroll_config_data(config.virtual_scroll_config),
                     )
                 if config.js_code:
                     js_values = await self._evaluate_scripts(page, config.js_code)
@@ -407,6 +505,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             config.js_code_before_wait
             or config.js_code
             or config.scan_full_page
+            or config.virtual_scroll_config
             or config.screenshot
             or config.pdf
         )
@@ -439,20 +538,32 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         identity = self._resolve_session_identity(
             getattr(config, "locale", None), getattr(config, "timezone_id", None)
         )
+        geolocation = self._resolve_session_geolocation(
+            getattr(config, "geolocation", None)
+        )
         if self._session is None:
-            await self.start(locale=identity[0], timezone_id=identity[1])
+            await self.start(
+                locale=identity[0],
+                timezone_id=identity[1],
+                geolocation=geolocation,
+            )
             return
         requested_user_agent = self._resolve_session_user_agent()
         if (
             self._session_identity != identity
+            or self._session_geolocation != geolocation
             or self._session_user_agent != requested_user_agent
         ):
             if not self._session_has_fetched:
                 await self.close()
-                await self.start(locale=identity[0], timezone_id=identity[1])
+                await self.start(
+                    locale=identity[0],
+                    timezone_id=identity[1],
+                    geolocation=geolocation,
+                )
                 return
             raise ValueError(
-                "Scrapling fixes locale, timezone_id, and user_agent per browser "
+                "Scrapling fixes locale, timezone_id, geolocation, and user_agent per browser "
                 "context; set them before the first crawl or use a separate strategy."
             )
 
@@ -463,6 +574,51 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             self.scrapling_options.get("locale") or locale,
             self.scrapling_options.get("timezone_id") or timezone_id,
         )
+
+    def _resolve_session_geolocation(
+        self, geolocation: Any | None
+    ) -> tuple[float, float, float] | None:
+        configured = self.scrapling_options.get("additional_args")
+        configured_geolocation = (
+            configured.get("geolocation") if isinstance(configured, dict) else None
+        )
+        return self._normalize_geolocation(configured_geolocation or geolocation)
+
+    @staticmethod
+    def _normalize_geolocation(value: Any | None) -> tuple[float, float, float] | None:
+        if value is None:
+            return None
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            latitude, longitude = value[:2]
+            accuracy = value[2] if len(value) > 2 else 0
+        elif isinstance(value, dict):
+            latitude = value.get("latitude")
+            longitude = value.get("longitude")
+            accuracy = value.get("accuracy", value.get("accuracy_m", 0))
+        else:
+            latitude = getattr(value, "latitude", None)
+            longitude = getattr(value, "longitude", None)
+            accuracy = getattr(value, "accuracy", getattr(value, "accuracy_m", 0))
+        if latitude is None or longitude is None:
+            return None
+        return float(latitude), float(longitude), float(accuracy or 0)
+
+    @staticmethod
+    def _virtual_scroll_config_data(config: Any) -> dict[str, Any]:
+        to_dict = getattr(config, "to_dict", None)
+        if callable(to_dict):
+            return dict(to_dict())
+        if isinstance(config, dict):
+            return dict(config)
+        return {
+            key: getattr(config, key)
+            for key in (
+                "container_selector",
+                "scroll_count",
+                "scroll_by",
+                "wait_after_scroll",
+            )
+        }
 
     def _resolve_session_user_agent(self) -> str | None:
         configured = self.scrapling_options.get("useragent")
