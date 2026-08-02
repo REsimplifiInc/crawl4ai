@@ -49,6 +49,8 @@ async ({max_scroll_steps, scroll_delay}) => {
 _LEGACY_DEFAULT_CHROMIUM_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36"
 )
+_BROWSER_IDENTITY_HEADER_NAMES = {"user-agent", "accept-language"}
+_BROWSER_IDENTITY_HEADER_PREFIXES = ("sec-ch-ua",)
 
 
 class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
@@ -73,6 +75,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         self.scrapling_options = dict(scrapling_options or {})
         self._session: Any | None = None
         self._session_identity: tuple[str | None, str | None] | None = None
+        self._session_has_fetched = False
 
     async def __aenter__(self) -> Any:
         await self.start()
@@ -117,11 +120,13 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             raise
         self._session = session
         self._session_identity = identity
+        self._session_has_fetched = False
 
     async def close(self) -> None:
         """Close the Scrapling browser session and release its resources."""
         session, self._session = self._session, None
         self._session_identity = None
+        self._session_has_fetched = False
         if session is None:
             return
         close = getattr(session, "close", None)
@@ -201,6 +206,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             browser_url = temporary_path.as_uri()
 
         try:
+            self._session_has_fetched = True
             response = await self._session.fetch(browser_url, **fetch_kwargs)
             if page_action_error := captures.get("page_action_error"):
                 raise RuntimeError(
@@ -235,7 +241,6 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         kwargs: dict[str, Any] = {
             "headless": config.headless,
             "cookies": config.cookies,
-            "extra_headers": config.headers,
             "user_data_dir": config.user_data_dir,
             "cdp_url": config.cdp_url,
             "locale": locale,
@@ -246,11 +251,30 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             and config.user_agent != _LEGACY_DEFAULT_CHROMIUM_USER_AGENT
         ):
             kwargs["useragent"] = config.user_agent
+            kwargs["extra_headers"] = config.headers
+        else:
+            kwargs["extra_headers"] = self._headers_without_browser_identity(
+                config.headers
+            )
         proxy = self._proxy_value(config.proxy_config)
         if proxy is not None:
             kwargs["proxy"] = proxy
         kwargs.update(self.scrapling_options)
         return {key: value for key, value in kwargs.items() if value is not None}
+
+    @staticmethod
+    def _headers_without_browser_identity(
+        headers: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not headers:
+            return headers
+        filtered = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in _BROWSER_IDENTITY_HEADER_NAMES
+            and not key.lower().startswith(_BROWSER_IDENTITY_HEADER_PREFIXES)
+        }
+        return filtered or None
 
     def _build_fetch_kwargs(
         self, config: CrawlerRunConfig, captures: dict[str, Any]
@@ -262,13 +286,8 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             "network_idle": config.wait_until == "networkidle",
         }
 
-        wait_selector = self._css_wait_selector(config.wait_for)
         has_page_action = self._needs_page_action(config)
-        if wait_selector is not None and not has_page_action:
-            kwargs["wait_selector"] = wait_selector
-        if (
-            config.wait_for and (wait_selector is None or has_page_action)
-        ) or has_page_action:
+        if config.wait_for or has_page_action:
             kwargs["page_action"] = self._build_page_action(config, captures)
         if config.capture_network_requests or config.capture_console_messages:
             kwargs["page_setup"] = self._build_page_setup(config, captures)
@@ -416,6 +435,10 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             await self.start(locale=identity[0], timezone_id=identity[1])
             return
         if self._session_identity != identity:
+            if not self._session_has_fetched:
+                await self.close()
+                await self.start(locale=identity[0], timezone_id=identity[1])
+                return
             raise ValueError(
                 "Scrapling fixes locale and timezone_id per browser context; "
                 "set them before the first crawl or use a separate strategy."

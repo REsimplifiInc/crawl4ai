@@ -141,7 +141,8 @@ async def test_scrapling_strategy_maps_browser_and_fetch_config_and_response():
     assert url == "https://example.test/listing"
     assert fetch_kwargs["timeout"] == 17_000
     assert fetch_kwargs["wait"] == 1_250
-    assert fetch_kwargs["wait_selector"] == ".listing"
+    assert "wait_selector" not in fetch_kwargs
+    assert callable(fetch_kwargs["page_action"])
     assert response.html == FakeScraplingResponse.body.decode()
     assert response.status_code == 200
     assert response.response_headers == FakeScraplingResponse.headers
@@ -161,6 +162,39 @@ async def test_scrapling_strategy_uses_run_identity_and_default_scrapling_user_a
     assert session.kwargs["locale"] == "fr-FR"
     assert session.kwargs["timezone_id"] == "Europe/Paris"
     assert "useragent" not in session.kwargs
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_restarts_preflight_session_for_run_identity():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    async with AsyncWebCrawler(
+        crawler_strategy=strategy,
+        config=BrowserConfig(),
+    ) as crawler:
+        await crawler.arun(
+            "https://example.test/listing",
+            config=CrawlerRunConfig(locale="fr-FR", timezone_id="Europe/Paris"),
+        )
+
+    assert len(FakeSession.instances) == 2
+    assert FakeSession.instances[0].kwargs.get("locale") is None
+    assert FakeSession.instances[1].kwargs["locale"] == "fr-FR"
+    assert FakeSession.instances[1].kwargs["timezone_id"] == "Europe/Paris"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_removes_stale_identity_headers_for_default_user_agent():
+    strategy = AsyncScraplingCrawlerStrategy(
+        browser_config=BrowserConfig(
+            headers={"sec-ch-ua": '"Chromium";v="116"', "X-Test": "yes"}
+        ),
+        session_factory=FakeSession,
+    )
+
+    await strategy.start()
+
+    assert FakeSession.instances[0].kwargs["extra_headers"] == {"X-Test": "yes"}
 
 
 @pytest.mark.asyncio
