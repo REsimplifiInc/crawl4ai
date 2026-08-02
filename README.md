@@ -288,7 +288,9 @@ async with AsyncWebCrawler(
 This strategy keeps Crawl4AI's HTML processing and extraction pipeline while
 Scrapling owns the browser session. It supports one-shot fetches, waits, page
 actions, screenshots, and PDFs. Crawl4AI `session_id` reuse is intentionally
-rejected; combine page actions into one crawl when using this strategy.
+rejected; combine page actions into one crawl when using this strategy. A
+per-crawl user-agent override is honored before the first fetch, but browser
+identity cannot change after a context has been used.
 
 The optional extra pins the compatible Scrapling 0.4.9 fetcher and fingerprint
 dataset so its Chromium 148 identity data remains available.

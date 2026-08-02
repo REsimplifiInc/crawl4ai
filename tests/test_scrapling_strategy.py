@@ -184,6 +184,35 @@ async def test_scrapling_strategy_restarts_preflight_session_for_run_identity():
 
 
 @pytest.mark.asyncio
+async def test_scrapling_strategy_restarts_preflight_session_for_run_user_agent():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    async with AsyncWebCrawler(
+        crawler_strategy=strategy,
+        config=BrowserConfig(),
+    ) as crawler:
+        result = await crawler.arun(
+            "https://example.test/listing",
+            config=CrawlerRunConfig(user_agent="Mozilla/5.0 custom"),
+        )
+
+    assert result.success
+    assert len(FakeSession.instances) == 2
+    assert "useragent" not in FakeSession.instances[0].kwargs
+    assert FakeSession.instances[1].kwargs["useragent"] == "Mozilla/5.0 custom"
+
+
+@pytest.mark.asyncio
+async def test_scrapling_strategy_rejects_user_agent_change_after_fetch():
+    strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)
+
+    await strategy.crawl("https://example.test/listing")
+
+    with pytest.raises(ValueError, match="first Scrapling fetch"):
+        strategy.update_user_agent("Mozilla/5.0 custom")
+
+
+@pytest.mark.asyncio
 async def test_scrapling_strategy_removes_stale_identity_headers_for_default_user_agent():
     strategy = AsyncScraplingCrawlerStrategy(
         browser_config=BrowserConfig(

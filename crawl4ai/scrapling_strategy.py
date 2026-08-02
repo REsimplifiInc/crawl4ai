@@ -75,6 +75,7 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         self.scrapling_options = dict(scrapling_options or {})
         self._session: Any | None = None
         self._session_identity: tuple[str | None, str | None] | None = None
+        self._session_user_agent: str | None = None
         self._session_has_fetched = False
 
     async def __aenter__(self) -> Any:
@@ -120,12 +121,14 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             raise
         self._session = session
         self._session_identity = identity
+        self._session_user_agent = self._resolve_session_user_agent()
         self._session_has_fetched = False
 
     async def close(self) -> None:
         """Close the Scrapling browser session and release its resources."""
         session, self._session = self._session, None
         self._session_identity = None
+        self._session_user_agent = None
         self._session_has_fetched = False
         if session is None:
             return
@@ -143,11 +146,16 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         )
 
     def update_user_agent(self, user_agent: str) -> None:
-        """Set the user agent before the Scrapling session is started."""
-        if self._session is not None and user_agent != self.browser_config.user_agent:
+        """Set the user agent before the Scrapling session performs a fetch."""
+        requested = self._normalize_user_agent(user_agent)
+        if (
+            self._session is not None
+            and self._session_has_fetched
+            and requested != self._session_user_agent
+        ):
             raise ValueError(
-                "Set BrowserConfig.user_agent before starting "
-                "AsyncScraplingCrawlerStrategy; Scrapling fixes it per browser context."
+                "Set CrawlerRunConfig.user_agent before the first Scrapling fetch; "
+                "Scrapling fixes it per browser context."
             )
         self.browser_config.user_agent = user_agent
 
@@ -434,14 +442,18 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         if self._session is None:
             await self.start(locale=identity[0], timezone_id=identity[1])
             return
-        if self._session_identity != identity:
+        requested_user_agent = self._resolve_session_user_agent()
+        if (
+            self._session_identity != identity
+            or self._session_user_agent != requested_user_agent
+        ):
             if not self._session_has_fetched:
                 await self.close()
                 await self.start(locale=identity[0], timezone_id=identity[1])
                 return
             raise ValueError(
-                "Scrapling fixes locale and timezone_id per browser context; "
-                "set them before the first crawl or use a separate strategy."
+                "Scrapling fixes locale, timezone_id, and user_agent per browser "
+                "context; set them before the first crawl or use a separate strategy."
             )
 
     def _resolve_session_identity(
@@ -451,6 +463,18 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
             self.scrapling_options.get("locale") or locale,
             self.scrapling_options.get("timezone_id") or timezone_id,
         )
+
+    def _resolve_session_user_agent(self) -> str | None:
+        configured = self.scrapling_options.get("useragent")
+        if configured is not None:
+            return str(configured)
+        return self._normalize_user_agent(self.browser_config.user_agent)
+
+    @staticmethod
+    def _normalize_user_agent(user_agent: str | None) -> str | None:
+        if not user_agent or user_agent == _LEGACY_DEFAULT_CHROMIUM_USER_AGENT:
+            return None
+        return user_agent
 
     @staticmethod
     def _needs_browser_processing(config: CrawlerRunConfig) -> bool:
