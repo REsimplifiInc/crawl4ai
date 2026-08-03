@@ -684,6 +684,9 @@ class _PlaywrightRuntimeBackend:
     def __init__(self, manager: "BrowserManager"):
         self.manager = manager
 
+    async def after_navigation(self, page, crawler_run_config):
+        return None
+
     def _proxy_settings(self):
         if not self.manager.config.proxy_config:
             return None
@@ -846,6 +849,9 @@ class _CamoufoxRuntimeBackend:
     def __init__(self, manager: "BrowserManager"):
         self.manager = manager
         self._context_manager = None
+
+    async def after_navigation(self, page, crawler_run_config):
+        return None
 
     def _import_async_camoufox(self):
         try:
@@ -1120,6 +1126,19 @@ class _ScraplingRuntimeBackend:
         except Exception:
             await self.close()
             raise
+
+    async def after_navigation(self, page, crawler_run_config):
+        if not (
+            self.session
+            and (self.manager.config.scrapling_options or {}).get("solve_cloudflare")
+        ):
+            return
+        solver = getattr(self.session, "_cloudflare_solver", None)
+        if solver is None:
+            raise RuntimeError(
+                "The installed Scrapling version does not expose its Cloudflare solver."
+            )
+        await solver(page)
 
     async def close(self):
         session, self.session = self.session, None
@@ -2102,6 +2121,9 @@ class BrowserManager:
         await self._maybe_bump_browser_version()
 
         return page, context
+
+    async def after_navigation(self, page, crawlerRunConfig: CrawlerRunConfig):
+        await self.runtime_backend.after_navigation(page, crawlerRunConfig)
 
     async def kill_session(self, session_id: str):
         """
