@@ -880,6 +880,11 @@ class BrowserConfig:
                     "browser_runtime='scrapling' does not support cdp_url or "
                     "managed CDP browser connections."
                 )
+            if self.use_managed_browser:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support managed-browser "
+                    "startup."
+                )
             if self.storage_state:
                 raise ValueError(
                     "browser_runtime='scrapling' does not support storage_state. "
