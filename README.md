@@ -253,22 +253,18 @@ By default, this will install the asynchronous version of Crawl4AI, using Playwr
 ### Optional Scrapling stealth strategy
 
 For sources that require a stronger anti-bot browser, install the optional
-Scrapling/Patchright strategy and select it explicitly:
+Scrapling/Patchright runtime:
 
 ```bash
 pip install "crawl4ai[scrapling]"
 ```
 
 ```python
-from crawl4ai import (
-    AsyncScraplingCrawlerStrategy,
-    AsyncWebCrawler,
-    BrowserConfig,
-    CrawlerRunConfig,
-)
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
-strategy = AsyncScraplingCrawlerStrategy(
-    browser_config=BrowserConfig(headless=True),
+browser_config = BrowserConfig(
+    browser_runtime="scrapling",
+    headless=True,
     scrapling_options={
         "solve_cloudflare": True,
         "hide_canvas": True,
@@ -276,9 +272,7 @@ strategy = AsyncScraplingCrawlerStrategy(
     },
 )
 
-async with AsyncWebCrawler(
-    config=strategy.browser_config, crawler_strategy=strategy
-) as crawler:
+async with AsyncWebCrawler(config=browser_config) as crawler:
     result = await crawler.arun(
         "https://example.com",
         config=CrawlerRunConfig(),

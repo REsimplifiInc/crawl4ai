@@ -161,6 +161,45 @@ async def test_scrapling_strategy_maps_browser_and_fetch_config_and_response():
     assert response.redirected_url == "https://example.test/final"
 
 
+def test_browser_config_accepts_scrapling_runtime_options():
+    config = BrowserConfig(
+        browser_runtime="scrapling",
+        scrapling_options={"solve_cloudflare": True},
+    )
+
+    assert config.browser_runtime == "scrapling"
+    assert config.scrapling_options == {"solve_cloudflare": True}
+
+
+def test_async_web_crawler_selects_scrapling_runtime_strategy():
+    config = BrowserConfig(
+        browser_runtime="scrapling",
+        scrapling_options={"solve_cloudflare": True},
+    )
+
+    crawler = AsyncWebCrawler(config=config)
+
+    assert isinstance(crawler.crawler_strategy, AsyncScraplingCrawlerStrategy)
+    assert crawler.crawler_strategy.scrapling_options == {"solve_cloudflare": True}
+
+
+@pytest.mark.asyncio
+async def test_scrapling_runtime_passes_options_to_session_factory():
+    config = BrowserConfig(
+        browser_runtime="scrapling",
+        scrapling_options={"solve_cloudflare": True},
+    )
+    strategy = AsyncScraplingCrawlerStrategy(
+        browser_config=config,
+        session_factory=FakeSession,
+    )
+
+    await strategy.start()
+
+    assert FakeSession.instances[-1].kwargs["solve_cloudflare"] is True
+    await strategy.close()
+
+
 @pytest.mark.asyncio
 async def test_scrapling_strategy_uses_run_identity_and_default_scrapling_user_agent():
     strategy = AsyncScraplingCrawlerStrategy(session_factory=FakeSession)

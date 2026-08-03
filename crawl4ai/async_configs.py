@@ -46,6 +46,7 @@ DEFAULT_FIREFOX_USER_AGENT = (
     "Gecko/20100101 Firefox/135.0"
 )
 CAMOUFOX_RUNTIME = "camoufox"
+SCRAPLING_RUNTIME = "scrapling"
 CAMOUFOX_IDENTITY_HEADER_NAMES = {"user-agent", "accept-language"}
 CAMOUFOX_IDENTITY_HEADER_PREFIXES = ("sec-ch-ua",)
 CAMOUFOX_BLOCKED_RUN_FIELDS = (
@@ -549,7 +550,7 @@ class BrowserConfig:
     code will then reference these settings to initialize the browser in a consistent, documented manner.
 
     Attributes:
-        browser_runtime (str): Browser automation runtime. Supported values: "playwright" and "camoufox".
+        browser_runtime (str): Browser automation runtime. Supported values: "playwright", "camoufox", and "scrapling".
                                Default: "playwright".
         browser_type (str): The type of browser to launch. Supported values: "chromium", "firefox", "webkit".
                             Default: "chromium".
@@ -694,6 +695,7 @@ class BrowserConfig:
         user_agent_mode: str = "",
         user_agent_generator_config: dict = None,
         camoufox_options: Optional[Dict[str, Any]] = None,
+        scrapling_options: Optional[Dict[str, Any]] = None,
         text_mode: bool = False,
         light_mode: bool = False,
         extra_args: list = None,
@@ -766,6 +768,9 @@ class BrowserConfig:
         self.user_agent_mode = user_agent_mode
         self.user_agent_generator_config = user_agent_generator_config or {}
         self.camoufox_options = camoufox_options if camoufox_options is not None else None
+        self.scrapling_options = (
+            copy.deepcopy(scrapling_options) if scrapling_options is not None else None
+        )
         self.text_mode = text_mode
         self.light_mode = light_mode
         self.extra_args = extra_args if extra_args is not None else []
@@ -832,8 +837,12 @@ class BrowserConfig:
         return self.browser_runtime == CAMOUFOX_RUNTIME
 
     @property
+    def is_scrapling(self) -> bool:
+        return self.browser_runtime == SCRAPLING_RUNTIME
+
+    @property
     def uses_browser_scoped_identity(self) -> bool:
-        return self.is_camoufox
+        return self.is_camoufox or self.is_scrapling
 
     def _default_user_agent(self) -> str:
         if self.browser_type == "firefox":
@@ -846,9 +855,9 @@ class BrowserConfig:
         requested_headers: Dict[str, Any],
         requested_camoufox_options: Optional[Dict[str, Any]],
     ) -> None:
-        if self.browser_runtime not in {"playwright", CAMOUFOX_RUNTIME}:
+        if self.browser_runtime not in {"playwright", CAMOUFOX_RUNTIME, SCRAPLING_RUNTIME}:
             raise ValueError(
-                "browser_runtime must be one of: 'playwright', 'camoufox'."
+                "browser_runtime must be one of: 'playwright', 'camoufox', 'scrapling'."
             )
 
         if not self.is_camoufox:
@@ -971,6 +980,7 @@ class BrowserConfig:
             "user_agent_mode": self.user_agent_mode,
             "user_agent_generator_config": self.user_agent_generator_config,
             "camoufox_options": self.camoufox_options,
+            "scrapling_options": self.scrapling_options,
             "text_mode": self.text_mode,
             "light_mode": self.light_mode,
             "extra_args": self.extra_args,

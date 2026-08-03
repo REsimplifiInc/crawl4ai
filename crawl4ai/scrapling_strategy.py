@@ -138,7 +138,11 @@ class AsyncScraplingCrawlerStrategy(AsyncCrawlerStrategy):
         self.browser_config = browser_config or BrowserConfig.from_kwargs(kwargs)
         self.logger = logger or AsyncLogger(verbose=self.browser_config.verbose)
         self.session_factory = session_factory
-        self.scrapling_options = dict(scrapling_options or {})
+        self.scrapling_options = dict(
+            scrapling_options
+            if scrapling_options is not None
+            else (self.browser_config.scrapling_options or {})
+        )
         self._session: Any | None = None
         self._session_identity: tuple[str | None, str | None] | None = None
         self._session_geolocation: tuple[float, float, float] | None = None
