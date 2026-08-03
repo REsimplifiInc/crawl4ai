@@ -1,5 +1,6 @@
 import pytest
 from playwright.async_api import Error
+from patchright.async_api import Error as PatchrightError
 
 from crawl4ai.async_crawler_strategy import get_page_content
 
@@ -20,9 +21,10 @@ class PageContentSequence:
 
 
 @pytest.mark.asyncio
-async def test_get_page_content_retries_transient_navigation_error():
+@pytest.mark.parametrize("error_type", [Error, PatchrightError])
+async def test_get_page_content_retries_transient_navigation_error(error_type):
     page = PageContentSequence(
-        Error(
+        error_type(
             "Page.content: Unable to retrieve content because the page is navigating and changing the content."
         ),
         "<html>ready</html>",

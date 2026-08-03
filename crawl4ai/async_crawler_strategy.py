@@ -9,6 +9,8 @@ from typing import Optional, AsyncGenerator, Final
 import os
 from playwright.async_api import Page, Error
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import Error as PatchrightError
+from patchright.async_api import TimeoutError as PatchrightTimeoutError
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import hashlib
@@ -38,6 +40,8 @@ _PAGE_NAVIGATION_ERROR_MARKERS = (
     "page is navigating",
     "changing the content",
 )
+_PAGE_ERRORS = (Error, PatchrightError)
+_PAGE_TIMEOUT_ERRORS = (PlaywrightTimeoutError, PatchrightTimeoutError)
 
 
 async def get_page_content(
@@ -56,7 +60,7 @@ async def get_page_content(
     for attempt in range(max_retries + 1):
         try:
             return await page.content()
-        except Error as exc:
+        except _PAGE_ERRORS as exc:
             message = str(exc).lower()
             is_navigation_race = any(
                 marker in message for marker in _PAGE_NAVIGATION_ERROR_MARKERS
@@ -66,7 +70,7 @@ async def get_page_content(
 
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=5000)
-            except PlaywrightTimeoutError:
+            except _PAGE_TIMEOUT_ERRORS:
                 pass
             await asyncio.sleep(retry_delay * (attempt + 1))
 
