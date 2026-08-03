@@ -679,9 +679,13 @@ class _PlaywrightRuntimeBackend:
     requires_playwright = True
     supports_managed_browser = True
     applies_browser_scoped_identity = False
+    owns_persistent_context = False
 
     def __init__(self, manager: "BrowserManager"):
         self.manager = manager
+
+    async def after_navigation(self, page, crawler_run_config):
+        return None
 
     def _proxy_settings(self):
         if not self.manager.config.proxy_config:
@@ -840,10 +844,14 @@ class _CamoufoxRuntimeBackend:
     requires_playwright = False
     supports_managed_browser = False
     applies_browser_scoped_identity = True
+    owns_persistent_context = False
 
     def __init__(self, manager: "BrowserManager"):
         self.manager = manager
         self._context_manager = None
+
+    async def after_navigation(self, page, crawler_run_config):
+        return None
 
     def _import_async_camoufox(self):
         try:
@@ -962,6 +970,7 @@ class _CamoufoxRuntimeBackend:
                 if self._context_manager is context_manager:
                     self._context_manager = None
 
+
     @classmethod
     def _consume_future_result(cls, future):
         if future is None:
@@ -1043,6 +1052,100 @@ class _CamoufoxRuntimeBackend:
         return True
 
 
+class _ScraplingRuntimeBackend:
+    runtime_name = "scrapling"
+    requires_playwright = False
+    supports_managed_browser = False
+    applies_browser_scoped_identity = True
+    owns_persistent_context = True
+
+    def __init__(self, manager: "BrowserManager"):
+        self.manager = manager
+        self.session = None
+        self.session_factory = None
+
+    @staticmethod
+    def _load_session_factory():
+        try:
+            module = importlib.import_module("scrapling.fetchers")
+            return module.AsyncStealthySession
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "browser_runtime='scrapling' requires the optional Scrapling dependency. "
+                "Install it with `pip install 'crawl4ai[scrapling]'`."
+            ) from exc
+
+    @staticmethod
+    def _proxy_settings(proxy_config):
+        if not proxy_config:
+            return None
+        return {
+            key: value
+            for key, value in {
+                "server": getattr(proxy_config, "server", None),
+                "username": getattr(proxy_config, "username", None),
+                "password": getattr(proxy_config, "password", None),
+            }.items()
+            if value is not None
+        }
+
+    def _build_session_kwargs(self, user_data_dir: str) -> dict:
+        config = self.manager.config
+        options = copy.deepcopy(config.scrapling_options or {})
+        additional_args = dict(options.pop("additional_args", {}) or {})
+        additional_args.setdefault(
+            "viewport",
+            {
+                "width": config.viewport_width,
+                "height": config.viewport_height,
+            },
+        )
+
+        kwargs = {
+            "headless": config.headless,
+            "cookies": config.cookies,
+            "user_data_dir": user_data_dir,
+            "locale": options.pop("locale", None),
+            "timezone_id": options.pop("timezone_id", None),
+            "additional_args": additional_args,
+            "extra_headers": config.headers or None,
+            "proxy": self._proxy_settings(config.proxy_config),
+        }
+        if config.user_agent and config.user_agent != config._default_user_agent():
+            kwargs["useragent"] = config.user_agent
+
+        kwargs.update(options)
+        return {key: value for key, value in kwargs.items() if value is not None}
+
+    async def launch_persistent_context(self, user_data_dir: str):
+        factory = self.session_factory or self._load_session_factory()
+        self.session = factory(**self._build_session_kwargs(user_data_dir))
+        try:
+            await self.session.start()
+            return self.session.context
+        except Exception:
+            await self.close()
+            raise
+
+    async def after_navigation(self, page, crawler_run_config):
+        if not (
+            self.session
+            and (self.manager.config.scrapling_options or {}).get("solve_cloudflare")
+        ):
+            return
+        solver = getattr(self.session, "_cloudflare_solver", None)
+        if solver is None:
+            raise RuntimeError(
+                "The installed Scrapling version does not expose its Cloudflare solver."
+            )
+        await solver(page)
+
+    async def close(self):
+        session, self.session = self.session, None
+        if session is not None:
+            await session.close()
+
+
 class BrowserManager:
     """
     Manages the browser instance and context.
@@ -1097,6 +1200,8 @@ class BrowserManager:
         self.runtime_backend = (
             _CamoufoxRuntimeBackend(self)
             if self.config.is_camoufox
+            else _ScraplingRuntimeBackend(self)
+            if self.config.is_scrapling
             else _PlaywrightRuntimeBackend(self)
         )
 
@@ -2017,6 +2122,9 @@ class BrowserManager:
 
         return page, context
 
+    async def after_navigation(self, page, crawlerRunConfig: CrawlerRunConfig):
+        await self.runtime_backend.after_navigation(page, crawlerRunConfig)
+
     async def kill_session(self, session_id: str):
         """
         Kill a browser session and clean up resources.
@@ -2381,6 +2489,25 @@ class BrowserManager:
                 if self.playwright:
                     await self.playwright.stop()
                     self.playwright = None
+            return
+
+        if self.runtime_backend.owns_persistent_context:
+            session_ids = list(self.sessions.keys())
+            for session_id in session_ids:
+                await self.kill_session(session_id)
+            for ctx in self.contexts_by_config.values():
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            self.contexts_by_config.clear()
+            self._context_refcounts.clear()
+            self._context_last_used.clear()
+            self._page_to_sig.clear()
+            await self.runtime_backend.close()
+            self.browser = None
+            self.default_context = None
+            self._launched_persistent = False
             return
 
         if self.config.is_camoufox:

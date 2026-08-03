@@ -781,6 +781,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         response = await page.goto(
                             url, wait_until=config.wait_until, timeout=config.page_timeout
                         )
+                        await self.browser_manager.after_navigation(page, config)
                         redirected_url = page.url
                         redirected_status_code = response.status if response else None
                     except Error as e:

@@ -46,6 +46,7 @@ DEFAULT_FIREFOX_USER_AGENT = (
     "Gecko/20100101 Firefox/135.0"
 )
 CAMOUFOX_RUNTIME = "camoufox"
+SCRAPLING_RUNTIME = "scrapling"
 CAMOUFOX_IDENTITY_HEADER_NAMES = {"user-agent", "accept-language"}
 CAMOUFOX_IDENTITY_HEADER_PREFIXES = ("sec-ch-ua",)
 CAMOUFOX_BLOCKED_RUN_FIELDS = (
@@ -58,6 +59,7 @@ CAMOUFOX_BLOCKED_RUN_FIELDS = (
     "override_navigator",
     "magic",
 )
+SCRAPLING_BLOCKED_RUN_FIELDS = CAMOUFOX_BLOCKED_RUN_FIELDS
 
 
 def _header_names(headers: Optional[Dict[str, Any]]) -> List[str]:
@@ -549,7 +551,7 @@ class BrowserConfig:
     code will then reference these settings to initialize the browser in a consistent, documented manner.
 
     Attributes:
-        browser_runtime (str): Browser automation runtime. Supported values: "playwright" and "camoufox".
+        browser_runtime (str): Browser automation runtime. Supported values: "playwright", "camoufox", and "scrapling".
                                Default: "playwright".
         browser_type (str): The type of browser to launch. Supported values: "chromium", "firefox", "webkit".
                             Default: "chromium".
@@ -694,6 +696,7 @@ class BrowserConfig:
         user_agent_mode: str = "",
         user_agent_generator_config: dict = None,
         camoufox_options: Optional[Dict[str, Any]] = None,
+        scrapling_options: Optional[Dict[str, Any]] = None,
         text_mode: bool = False,
         light_mode: bool = False,
         extra_args: list = None,
@@ -766,6 +769,9 @@ class BrowserConfig:
         self.user_agent_mode = user_agent_mode
         self.user_agent_generator_config = user_agent_generator_config or {}
         self.camoufox_options = camoufox_options if camoufox_options is not None else None
+        self.scrapling_options = (
+            copy.deepcopy(scrapling_options) if scrapling_options is not None else None
+        )
         self.text_mode = text_mode
         self.light_mode = light_mode
         self.extra_args = extra_args if extra_args is not None else []
@@ -819,6 +825,10 @@ class BrowserConfig:
         # If persistent context is requested, ensure managed browser is enabled
         if self.use_persistent_context:
             self.use_managed_browser = True
+
+        if self.is_scrapling:
+            self.use_persistent_context = True
+            self.use_managed_browser = True
             
         # Validate stealth configuration
         if self.enable_stealth and self.use_managed_browser and self.browser_mode == "builtin":
@@ -832,8 +842,12 @@ class BrowserConfig:
         return self.browser_runtime == CAMOUFOX_RUNTIME
 
     @property
+    def is_scrapling(self) -> bool:
+        return self.browser_runtime == SCRAPLING_RUNTIME
+
+    @property
     def uses_browser_scoped_identity(self) -> bool:
-        return self.is_camoufox
+        return self.is_camoufox or self.is_scrapling
 
     def _default_user_agent(self) -> str:
         if self.browser_type == "firefox":
@@ -846,10 +860,42 @@ class BrowserConfig:
         requested_headers: Dict[str, Any],
         requested_camoufox_options: Optional[Dict[str, Any]],
     ) -> None:
-        if self.browser_runtime not in {"playwright", CAMOUFOX_RUNTIME}:
+        if self.browser_runtime not in {"playwright", CAMOUFOX_RUNTIME, SCRAPLING_RUNTIME}:
             raise ValueError(
-                "browser_runtime must be one of: 'playwright', 'camoufox'."
+                "browser_runtime must be one of: 'playwright', 'camoufox', 'scrapling'."
             )
+
+        if self.is_scrapling:
+            if self.browser_type != "chromium":
+                raise ValueError(
+                    "browser_runtime='scrapling' requires browser_type='chromium'."
+                )
+            if self.browser_mode != "dedicated":
+                raise ValueError(
+                    "browser_runtime='scrapling' currently supports only "
+                    "browser_mode='dedicated'."
+                )
+            if self.cdp_url:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support cdp_url or "
+                    "managed CDP browser connections."
+                )
+            if self.use_managed_browser:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support managed-browser "
+                    "startup."
+                )
+            if self.storage_state:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support storage_state. "
+                    "Use scrapling_options or user_data_dir for browser state."
+                )
+            if self.enable_stealth:
+                raise ValueError(
+                    "browser_runtime='scrapling' cannot be combined with "
+                    "enable_stealth. Scrapling owns stealth behavior."
+                )
+            return
 
         if not self.is_camoufox:
             return
@@ -911,18 +957,23 @@ class BrowserConfig:
             )
 
     def validate_crawler_run_config(self, crawler_run_config: Optional["CrawlerRunConfig"]) -> None:
-        if not self.is_camoufox or crawler_run_config is None:
+        if not (self.is_camoufox or self.is_scrapling) or crawler_run_config is None:
             return
 
         invalid_fields = []
-        for field_name in CAMOUFOX_BLOCKED_RUN_FIELDS:
+        blocked_fields = (
+            CAMOUFOX_BLOCKED_RUN_FIELDS
+            if self.is_camoufox
+            else SCRAPLING_BLOCKED_RUN_FIELDS
+        )
+        for field_name in blocked_fields:
             if _config_value_is_set(getattr(crawler_run_config, field_name, None)):
                 invalid_fields.append(field_name)
 
         if invalid_fields:
             rendered = ", ".join(invalid_fields)
             raise ValueError(
-                "browser_runtime='camoufox' requires browser-scoped identity. "
+                f"browser_runtime='{self.browser_runtime}' requires browser-scoped identity. "
                 f"Remove these CrawlerRunConfig overrides: {rendered}."
             )
 
@@ -971,6 +1022,7 @@ class BrowserConfig:
             "user_agent_mode": self.user_agent_mode,
             "user_agent_generator_config": self.user_agent_generator_config,
             "camoufox_options": self.camoufox_options,
+            "scrapling_options": self.scrapling_options,
             "text_mode": self.text_mode,
             "light_mode": self.light_mode,
             "extra_args": self.extra_args,

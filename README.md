@@ -250,6 +250,45 @@ crawl4ai-setup # Setup the browser
 
 By default, this will install the asynchronous version of Crawl4AI, using Playwright for web crawling.
 
+### Optional Scrapling stealth runtime
+
+For sources that require a stronger anti-bot browser, install the optional
+Scrapling/Patchright runtime:
+
+```bash
+pip install "crawl4ai[scrapling]"
+```
+
+```python
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+browser_config = BrowserConfig(
+    browser_runtime="scrapling",
+    headless=True,
+    scrapling_options={
+        "solve_cloudflare": True,
+        "hide_canvas": True,
+        "block_webrtc": True,
+    },
+)
+
+async with AsyncWebCrawler(config=browser_config) as crawler:
+    result = await crawler.arun(
+        "https://example.com",
+        config=CrawlerRunConfig(),
+    )
+```
+
+This runtime keeps Crawl4AI's normal Playwright crawler strategy and HTML
+processing pipeline while Scrapling owns browser startup and stealth settings.
+It supports Crawl4AI waits, page actions, virtual-scroll capture, screenshots,
+PDFs, network capture, and extraction. Scrapling uses one browser-scoped
+persistent context, so locale, timezone, geolocation, and identity settings
+cannot change after the browser has started.
+
+The optional extra pins the compatible Scrapling 0.4.9 fetcher and fingerprint
+dataset so its Chromium 148 identity data remains available.
+
 👉 **Note**: When you install Crawl4AI, the `crawl4ai-setup` should automatically install and set up Playwright. However, if you encounter any Playwright-related errors, you can manually install it using one of these methods:
 
 1. Through the command line:
