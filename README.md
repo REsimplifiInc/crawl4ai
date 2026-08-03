@@ -250,7 +250,7 @@ crawl4ai-setup # Setup the browser
 
 By default, this will install the asynchronous version of Crawl4AI, using Playwright for web crawling.
 
-### Optional Scrapling stealth strategy
+### Optional Scrapling stealth runtime
 
 For sources that require a stronger anti-bot browser, install the optional
 Scrapling/Patchright runtime:
@@ -279,14 +279,12 @@ async with AsyncWebCrawler(config=browser_config) as crawler:
     )
 ```
 
-This strategy keeps Crawl4AI's HTML processing and extraction pipeline while
-Scrapling owns the browser session. It supports one-shot fetches, waits, page
-actions, virtual-scroll capture, screenshots, and PDFs. Browser-scoped locale,
-timezone, geolocation, and persistent-profile settings are passed to the
-Scrapling context. Crawl4AI `session_id` reuse and MHTML capture are
-intentionally rejected; combine page actions into one crawl when using this
-strategy. A per-crawl user-agent override is honored before the first fetch,
-but browser identity cannot change after a context has been used.
+This runtime keeps Crawl4AI's normal Playwright crawler strategy and HTML
+processing pipeline while Scrapling owns browser startup and stealth settings.
+It supports Crawl4AI waits, page actions, virtual-scroll capture, screenshots,
+PDFs, network capture, and extraction. Scrapling uses one browser-scoped
+persistent context, so locale, timezone, geolocation, and identity settings
+cannot change after the browser has started.
 
 The optional extra pins the compatible Scrapling 0.4.9 fetcher and fingerprint
 dataset so its Chromium 148 identity data remains available.

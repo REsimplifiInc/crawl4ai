@@ -29,7 +29,6 @@ from .async_crawler_strategy import (
     AsyncPlaywrightCrawlerStrategy,
     AsyncCrawlResponse,
 )
-from .scrapling_strategy import AsyncScraplingCrawlerStrategy
 from .cache_context import CacheMode, CacheContext
 from .markdown_generation_strategy import (
     DefaultMarkdownGenerator,
@@ -147,20 +146,11 @@ class AsyncWebCrawler:
         # Initialize crawler strategy
         params = {k: v for k, v in kwargs.items() if k in [
             "browser_config", "logger"]}
-        if crawler_strategy is not None:
-            self.crawler_strategy = crawler_strategy
-        elif browser_config.is_scrapling:
-            self.crawler_strategy = AsyncScraplingCrawlerStrategy(
-                browser_config=browser_config,
-                logger=self.logger,
-                **params,
-            )
-        else:
-            self.crawler_strategy = AsyncPlaywrightCrawlerStrategy(
-                browser_config=browser_config,
-                logger=self.logger,
-                **params,  # Pass remaining kwargs for backwards compatibility
-            )
+        self.crawler_strategy = crawler_strategy or AsyncPlaywrightCrawlerStrategy(
+            browser_config=browser_config,
+            logger=self.logger,
+            **params,  # Pass remaining kwargs for backwards compatibility
+        )
 
         # Thread safety setup
         self._lock = asyncio.Lock() if thread_safe else None

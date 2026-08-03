@@ -2,7 +2,6 @@
 import warnings
 
 from .async_webcrawler import AsyncWebCrawler, CacheMode
-from .scrapling_strategy import AsyncScraplingCrawlerStrategy
 # MODIFIED: Add SeedingConfig and VirtualScrollConfig here
 from .async_configs import BrowserConfig, CrawlerRunConfig, HTTPCrawlerConfig, LLMConfig, ProxyConfig, GeolocationConfig, SeedingConfig, VirtualScrollConfig, LinkPreviewConfig, MatchMode
 
@@ -115,7 +114,6 @@ __all__ = [
     "AsyncLoggerBase",
     "AsyncLogger",
     "AsyncWebCrawler",
-    "AsyncScraplingCrawlerStrategy",
     "BrowserProfiler",
     "LLMConfig",
     "GeolocationConfig",

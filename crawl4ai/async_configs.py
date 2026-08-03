@@ -59,6 +59,7 @@ CAMOUFOX_BLOCKED_RUN_FIELDS = (
     "override_navigator",
     "magic",
 )
+SCRAPLING_BLOCKED_RUN_FIELDS = CAMOUFOX_BLOCKED_RUN_FIELDS
 
 
 def _header_names(headers: Optional[Dict[str, Any]]) -> List[str]:
@@ -824,6 +825,10 @@ class BrowserConfig:
         # If persistent context is requested, ensure managed browser is enabled
         if self.use_persistent_context:
             self.use_managed_browser = True
+
+        if self.is_scrapling:
+            self.use_persistent_context = True
+            self.use_managed_browser = True
             
         # Validate stealth configuration
         if self.enable_stealth and self.use_managed_browser and self.browser_mode == "builtin":
@@ -859,6 +864,33 @@ class BrowserConfig:
             raise ValueError(
                 "browser_runtime must be one of: 'playwright', 'camoufox', 'scrapling'."
             )
+
+        if self.is_scrapling:
+            if self.browser_type != "chromium":
+                raise ValueError(
+                    "browser_runtime='scrapling' requires browser_type='chromium'."
+                )
+            if self.browser_mode != "dedicated":
+                raise ValueError(
+                    "browser_runtime='scrapling' currently supports only "
+                    "browser_mode='dedicated'."
+                )
+            if self.cdp_url:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support cdp_url or "
+                    "managed CDP browser connections."
+                )
+            if self.storage_state:
+                raise ValueError(
+                    "browser_runtime='scrapling' does not support storage_state. "
+                    "Use scrapling_options or user_data_dir for browser state."
+                )
+            if self.enable_stealth:
+                raise ValueError(
+                    "browser_runtime='scrapling' cannot be combined with "
+                    "enable_stealth. Scrapling owns stealth behavior."
+                )
+            return
 
         if not self.is_camoufox:
             return
@@ -920,18 +952,23 @@ class BrowserConfig:
             )
 
     def validate_crawler_run_config(self, crawler_run_config: Optional["CrawlerRunConfig"]) -> None:
-        if not self.is_camoufox or crawler_run_config is None:
+        if not (self.is_camoufox or self.is_scrapling) or crawler_run_config is None:
             return
 
         invalid_fields = []
-        for field_name in CAMOUFOX_BLOCKED_RUN_FIELDS:
+        blocked_fields = (
+            CAMOUFOX_BLOCKED_RUN_FIELDS
+            if self.is_camoufox
+            else SCRAPLING_BLOCKED_RUN_FIELDS
+        )
+        for field_name in blocked_fields:
             if _config_value_is_set(getattr(crawler_run_config, field_name, None)):
                 invalid_fields.append(field_name)
 
         if invalid_fields:
             rendered = ", ".join(invalid_fields)
             raise ValueError(
-                "browser_runtime='camoufox' requires browser-scoped identity. "
+                f"browser_runtime='{self.browser_runtime}' requires browser-scoped identity. "
                 f"Remove these CrawlerRunConfig overrides: {rendered}."
             )
 
