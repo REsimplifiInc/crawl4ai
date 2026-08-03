@@ -33,6 +33,46 @@ from types import MappingProxyType
 import contextlib
 from functools import partial
 
+
+_PAGE_NAVIGATION_ERROR_MARKERS = (
+    "page is navigating",
+    "changing the content",
+)
+
+
+async def get_page_content(
+    page: Page,
+    *,
+    max_retries: int = 3,
+    retry_delay: float = 0.25,
+) -> str:
+    """Capture HTML while tolerating a transient navigation/content race.
+
+    Challenge solvers and pages that redirect after load can leave Playwright in
+    a short-lived navigation state when HTML capture begins. Retry only that
+    specific error; browser/context failures and other errors must propagate
+    immediately.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await page.content()
+        except Error as exc:
+            message = str(exc).lower()
+            is_navigation_race = any(
+                marker in message for marker in _PAGE_NAVIGATION_ERROR_MARKERS
+            )
+            if not is_navigation_race or attempt == max_retries:
+                raise
+
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
+            await asyncio.sleep(retry_delay * (attempt + 1))
+
+    raise RuntimeError("unreachable")
+
+
 class AsyncCrawlerStrategy(ABC):
     """
     Abstract base class for crawler strategies.
@@ -1081,7 +1121,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         message="Shadow DOM flattening returned no content, falling back to page.content()",
                         tag="SCRAPE",
                     )
-                    html = await page.content()
+                    html = await get_page_content(page)
             elif config.css_selector:
                 try:
                     selectors = [s.strip() for s in config.css_selector.split(',')]
@@ -1102,7 +1142,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 except Error as e:
                     raise RuntimeError(f"Failed to extract HTML content: {str(e)}")
             else:
-                html = await page.content()
+                html = await get_page_content(page)
 
             await self.execute_hook(
                 "before_return_html", page=page, html=html, context=context, config=config
@@ -1146,7 +1186,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"delay": delay, "url": url},
                 )
                 await asyncio.sleep(delay)
-                return await page.content()
+                return await get_page_content(page)
 
             # For undetected browsers, retrieve console messages before returning
             if config.capture_console_messages and hasattr(self.adapter, 'retrieve_console_messages'):
