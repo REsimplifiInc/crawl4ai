@@ -36,6 +36,12 @@ import copy
 OG_REGEX = re.compile(r"^og:")
 TWITTER_REGEX = re.compile(r"^twitter:")
 DIMENSION_REGEX = re.compile(r"(\d+)(\D*)")
+CSS_BACKGROUND_DECLARATION_REGEX = re.compile(
+    r"(?:^|;)\s*background(?:-image)?\s*:\s*([^;]+)", re.IGNORECASE
+)
+CSS_URL_REGEX = re.compile(
+    r"url\(\s*(?:([\"'])(.*?)\1|([^)]*?))\s*\)", re.IGNORECASE
+)
 
 
 # Function to parse srcset
@@ -118,6 +124,47 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
         if self.logger:
             log_method = getattr(self.logger, level)
             log_method(message=message, tag=tag, **kwargs)
+
+    def _materialize_inline_css_background_images(
+        self, element: lhtml.HtmlElement, page_url: str
+    ) -> None:
+        """Convert inline CSS background URLs into images for media and markdown."""
+        seen_urls = {
+            urljoin(page_url, src.strip())
+            for src in element.xpath(".//img/@src")
+            if src and src.strip()
+        }
+
+        styled_elements = element.xpath(".//*[@style]")
+        if element.get("style"):
+            styled_elements.insert(0, element)
+
+        for styled_element in styled_elements:
+            style = styled_element.get("style", "")
+            for declaration in CSS_BACKGROUND_DECLARATION_REGEX.findall(style):
+                for quote, quoted_url, unquoted_url in CSS_URL_REGEX.findall(
+                    declaration
+                ):
+                    src = (quoted_url if quote else unquoted_url).strip()
+                    if not src or src.lower().startswith(
+                        ("data:", "blob:", "javascript:")
+                    ):
+                        continue
+
+                    canonical_url = urljoin(page_url, src)
+                    if canonical_url in seen_urls:
+                        continue
+                    seen_urls.add(canonical_url)
+
+                    image = lhtml.Element("img")
+                    image.set("src", src)
+                    image.set("data-c4a-source", "css-background")
+                    if alt := (
+                        styled_element.get("aria-label")
+                        or styled_element.get("title")
+                    ):
+                        image.set("alt", alt)
+                    styled_element.append(image)
 
     def scrap(self, url: str, html: str, **kwargs) -> ScrapingResult:
         """
@@ -310,6 +357,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 self._log("error", f"Error processing link: {str(e)}", "SCRAPE")
                 continue
 
+        # Materialize inline CSS backgrounds so they reach both media extraction
+        # and the cleaned HTML used by markdown generation.
+        if not kwargs.get("exclude_all_images", False):
+            self._materialize_inline_css_background_images(element, url)
+
         # Process images
         images = element.xpath(".//img")
         total_images = len(images)
@@ -463,6 +515,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
 
         if picture := img.xpath("./ancestor::picture[1]"):
             score += 1
+
+        if img.get("data-c4a-source") == "css-background":
+            # CSS backgrounds do not expose intrinsic dimensions or extensions,
+            # but an explicit background URL is itself a strong image signal.
+            score += 3
 
         if score <= kwargs.get("image_score_threshold", IMAGE_SCORE_THRESHOLD):
             return None
