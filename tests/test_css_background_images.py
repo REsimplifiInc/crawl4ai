@@ -70,3 +70,59 @@ def test_css_background_images_do_not_require_file_extensions():
     )
 
     assert [image["src"] for image in result["media"]["images"]] == image_urls
+
+
+def test_css_background_images_skip_non_http_schemes():
+    html = """
+    <div style="background: url(data:image/png;base64,abc)"></div>
+    <div style="background-image: url('blob:https://example.com/id')"></div>
+    <div style="background: url(javascript:alert(1))"></div>
+    """
+
+    result = LXMLWebScrapingStrategy()._scrap(
+        url="https://example.com/listings/123",
+        html=html,
+    )
+
+    assert result["media"]["images"] == []
+    assert "<img" not in result["cleaned_html"]
+
+
+def test_css_background_images_resolve_relative_urls_for_markdown():
+    result = LXMLWebScrapingStrategy()._scrap(
+        url="https://example.com/listings/123",
+        html='<div style="background-image: url(../images/house.jpg)"></div>',
+    )
+
+    assert [image["src"] for image in result["media"]["images"]] == [
+        "../images/house.jpg"
+    ]
+    markdown = DefaultMarkdownGenerator().generate_markdown(
+        result["cleaned_html"],
+        base_url="https://example.com/listings/123",
+        citations=False,
+    )
+    assert "https://example.com/images/house.jpg" in markdown.raw_markdown
+
+
+def test_css_background_images_allow_semicolons_in_quoted_urls():
+    image_url = "https://cdn.example.com/property.jpg?variant=hero;size=large"
+    result = LXMLWebScrapingStrategy()._scrap(
+        url="https://example.com/listings/123",
+        html=f'<div style="background-image: url(\'{image_url}\')"></div>',
+    )
+
+    assert [image["src"] for image in result["media"]["images"]] == [image_url]
+
+
+def test_css_background_images_deduplicate_repeated_urls_globally():
+    image_url = "https://cdn.example.com/property.jpg"
+    result = LXMLWebScrapingStrategy()._scrap(
+        url="https://example.com/listings/123",
+        html=(
+            f'<section style="background: url({image_url})"></section>'
+            f'<aside style="background-image: url({image_url})"></aside>'
+        ),
+    )
+
+    assert [image["src"] for image in result["media"]["images"]] == [image_url]
